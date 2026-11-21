@@ -243,6 +243,8 @@ struct lru_gen_struct {
 	long nr_pages[MAX_NR_GENS][ANON_AND_FILE][MAX_NR_ZONES];
 };
 
+struct page;
+struct lruvec;
 extern bool lru_gen_enabled(void);
 extern void lru_gen_add_page(struct page *page, struct lruvec *lruvec, bool reclaiming);
 extern void lru_gen_del_page(struct page *page, struct lruvec *lruvec, bool reclaiming);
