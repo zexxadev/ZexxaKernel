@@ -2442,6 +2442,266 @@ module_param_named(scan_anon_prio, scan_anon_priority, int, 0644);
 /*
  * This is a basic per-node page freer.  Used by both kswapd and direct reclaim.
  */
+
+#ifdef CONFIG_LRU_GEN
+#include <linux/kobject.h>
+#include <linux/sysfs.h>
+
+static unsigned long lru_gen_min_ttl __read_mostly = HZ;
+#ifdef CONFIG_LRU_GEN_ENABLED
+static atomic_t lru_gen_enabled_flag = ATOMIC_INIT(1);
+#else
+static atomic_t lru_gen_enabled_flag = ATOMIC_INIT(0);
+#endif
+
+bool lru_gen_enabled(void)
+{
+	return atomic_read(&lru_gen_enabled_flag) > 0;
+}
+EXPORT_SYMBOL_GPL(lru_gen_enabled);
+
+static inline int page_lru_gen(struct page *page)
+{
+	return (test_bit(PG_lru_gen_0, &page->flags) ? 1 : 0) |
+	       (test_bit(PG_lru_gen_1, &page->flags) ? 2 : 0);
+}
+
+static inline void set_page_lru_gen(struct page *page, int gen)
+{
+	if (gen & 1)
+		set_bit(PG_lru_gen_0, &page->flags);
+	else
+		clear_bit(PG_lru_gen_0, &page->flags);
+	if (gen & 2)
+		set_bit(PG_lru_gen_1, &page->flags);
+	else
+		clear_bit(PG_lru_gen_1, &page->flags);
+}
+
+void lru_gen_add_page(struct page *page, struct lruvec *lruvec, bool reclaiming)
+{
+	struct lru_gen_struct *lrugen = &lruvec->lrugen;
+	int type = page_is_file_cache(page) ? 1 : 0;
+	int zone = page_zonenum(page);
+	unsigned long seq;
+	int gen;
+
+	if (PageActive(page) || PageReferenced(page))
+		seq = lrugen->max_seq;
+	else if (reclaiming || PageReclaim(page))
+		seq = lrugen->min_seq[type];
+	else
+		seq = lrugen->max_seq;
+
+	gen = seq % MAX_NR_GENS;
+	set_page_lru_gen(page, gen);
+	set_bit(PG_lru_gen, &page->flags);
+	list_add(&page->lru, &lrugen->lists[gen][type][zone]);
+	lrugen->nr_pages[gen][type][zone] += hpage_nr_pages(page);
+}
+
+void lru_gen_del_page(struct page *page, struct lruvec *lruvec, bool reclaiming)
+{
+	struct lru_gen_struct *lrugen = &lruvec->lrugen;
+	int type = page_is_file_cache(page) ? 1 : 0;
+	int zone = page_zonenum(page);
+	int gen = page_lru_gen(page);
+
+	clear_bit(PG_lru_gen, &page->flags);
+	clear_bit(PG_lru_gen_0, &page->flags);
+	clear_bit(PG_lru_gen_1, &page->flags);
+	clear_bit(PG_lru_gen_tier, &page->flags);
+	list_del(&page->lru);
+	lrugen->nr_pages[gen][type][zone] -= hpage_nr_pages(page);
+}
+
+static bool lru_gen_can_age(struct lru_gen_struct *lrugen)
+{
+	unsigned long min_seq = min(lrugen->min_seq[0], lrugen->min_seq[1]);
+
+	return lrugen->max_seq - min_seq < MAX_NR_GENS - 1;
+}
+
+static void lru_gen_age_node(struct pglist_data *pgdat, struct lruvec *lruvec)
+{
+	struct lru_gen_struct *lrugen = &lruvec->lrugen;
+	int type, zone, old_gen, next_gen;
+
+	if (!lru_gen_can_age(lrugen))
+		return;
+
+	next_gen = (lrugen->max_seq + 1) % MAX_NR_GENS;
+	for (type = 0; type < ANON_AND_FILE; type++) {
+		for (zone = 0; zone < MAX_NR_ZONES; zone++) {
+			if (!list_empty(&lrugen->lists[next_gen][type][zone]))
+				return;
+		}
+	}
+
+	lrugen->max_seq++;
+	old_gen = lrugen->max_seq % MAX_NR_GENS;
+	lrugen->timestamps[old_gen] = jiffies;
+}
+
+static unsigned long evict_gen_pages(struct lruvec *lruvec, struct scan_control *sc,
+				     int type, int swappiness)
+{
+	struct lru_gen_struct *lrugen = &lruvec->lrugen;
+	unsigned long seq = lrugen->min_seq[type];
+	int gen = seq % MAX_NR_GENS;
+	int young_gen = lrugen->max_seq % MAX_NR_GENS;
+	int zone;
+	LIST_HEAD(list);
+	unsigned long nr_isolated = 0;
+	unsigned long nr_reclaimed = 0;
+	struct blk_plug plug;
+
+	if (seq + MIN_NR_GENS > lrugen->max_seq)
+		return 0;
+
+	if (time_is_after_jiffies(lrugen->timestamps[gen] + lru_gen_min_ttl))
+		return 0;
+
+	for (zone = sc->reclaim_idx; zone >= 0; zone--) {
+		struct list_head *head = &lrugen->lists[gen][type][zone];
+
+		while (!list_empty(head) && nr_isolated < SWAP_CLUSTER_MAX) {
+			struct page *page = lru_to_page(head);
+			unsigned long vm_flags = 0;
+
+			if (!get_page_unless_zero(page))
+				continue;
+
+			if (unlikely(!PageLRU(page)) || !test_bit(PG_lru_gen, &page->flags)) {
+				put_page(page);
+				continue;
+			}
+
+			if (page_referenced(page, 0, sc->target_mem_cgroup, &vm_flags) > 0) {
+				/* Promote hot page to youngest generation */
+				list_move(&page->lru, &lrugen->lists[young_gen][type][zone]);
+				lrugen->nr_pages[gen][type][zone] -= hpage_nr_pages(page);
+				lrugen->nr_pages[young_gen][type][zone] += hpage_nr_pages(page);
+				set_page_lru_gen(page, young_gen);
+				ClearPageReferenced(page);
+				put_page(page);
+				continue;
+			}
+
+			if (!TestClearPageLRU(page)) {
+				put_page(page);
+				continue;
+			}
+
+			lru_gen_del_page(page, lruvec, true);
+			update_lru_size(lruvec, type ? LRU_INACTIVE_FILE : LRU_INACTIVE_ANON,
+					zone, -hpage_nr_pages(page));
+			list_add(&page->lru, &list);
+			nr_isolated += hpage_nr_pages(page);
+		}
+	}
+
+	if (!list_empty(&list)) {
+		blk_start_plug(&plug);
+		nr_reclaimed = shrink_page_list(&list, lruvec_pgdat(lruvec), sc,
+						TTU_UNMAP, NULL, false);
+		blk_finish_plug(&plug);
+		putback_inactive_pages(lruvec, &list);
+	}
+
+	/* Advance min_seq if all zones for this generation are empty */
+	for (zone = 0; zone < MAX_NR_ZONES; zone++) {
+		if (!list_empty(&lrugen->lists[gen][type][zone]))
+			return nr_reclaimed;
+	}
+	lrugen->min_seq[type]++;
+
+	return nr_reclaimed;
+}
+
+static bool lru_gen_shrink_lruvec(struct lruvec *lruvec, struct scan_control *sc)
+{
+	int swappiness = mem_cgroup_swappiness(sc->target_mem_cgroup);
+	unsigned long reclaimed = 0;
+	int type;
+
+	if (!lru_gen_enabled())
+		return false;
+
+	spin_lock_irq(&lruvec_pgdat(lruvec)->lru_lock);
+	lru_gen_age_node(lruvec_pgdat(lruvec), lruvec);
+	for (type = ANON_AND_FILE - 1; type >= 0; type--) {
+		if (type == 0 && (!swappiness || !sc->may_swap))
+			continue;
+		reclaimed += evict_gen_pages(lruvec, sc, type, swappiness);
+	}
+	spin_unlock_irq(&lruvec_pgdat(lruvec)->lru_lock);
+
+	sc->nr_reclaimed += reclaimed;
+	return true;
+}
+
+static ssize_t show_min_ttl(struct kobject *kobj, struct kobj_attribute *attr, char *buf)
+{
+	return sprintf(buf, "%u\n", jiffies_to_msecs(lru_gen_min_ttl));
+}
+
+static ssize_t store_min_ttl(struct kobject *kobj, struct kobj_attribute *attr,
+			     const char *buf, size_t len)
+{
+	unsigned int val;
+
+	if (kstrtouint(buf, 0, &val))
+		return -EINVAL;
+	lru_gen_min_ttl = msecs_to_jiffies(val);
+	return len;
+}
+
+static struct kobj_attribute lru_gen_min_ttl_attr =
+	__ATTR(min_ttl_ms, 0644, show_min_ttl, store_min_ttl);
+
+static ssize_t show_enabled(struct kobject *kobj, struct kobj_attribute *attr, char *buf)
+{
+	return sprintf(buf, "0x%04x\n", lru_gen_enabled() ? 0x0007 : 0x0000);
+}
+
+static ssize_t store_enabled(struct kobject *kobj, struct kobj_attribute *attr,
+			     const char *buf, size_t len)
+{
+	unsigned int val;
+
+	if (kstrtouint(buf, 0, &val))
+		return -EINVAL;
+	atomic_set(&lru_gen_enabled_flag, val ? 1 : 0);
+	return len;
+}
+
+static struct kobj_attribute lru_gen_enabled_attr =
+	__ATTR(enabled, 0644, show_enabled, store_enabled);
+
+static struct attribute *lru_gen_attrs[] = {
+	&lru_gen_min_ttl_attr.attr,
+	&lru_gen_enabled_attr.attr,
+	NULL,
+};
+
+static struct attribute_group lru_gen_attr_group = {
+	.name = "lru_gen",
+	.attrs = lru_gen_attrs,
+};
+
+static int __init init_lru_gen_sysfs(void)
+{
+	return sysfs_create_group(mm_kobj, &lru_gen_attr_group);
+}
+late_initcall(init_lru_gen_sysfs);
+#else
+static inline bool lru_gen_shrink_lruvec(struct lruvec *lruvec, struct scan_control *sc)
+{
+	return false;
+}
+#endif
+
 static void shrink_node_memcg(struct pglist_data *pgdat, struct mem_cgroup *memcg,
 			      struct scan_control *sc, unsigned long *lru_pages)
 {
@@ -2454,6 +2714,9 @@ static void shrink_node_memcg(struct pglist_data *pgdat, struct mem_cgroup *memc
 	unsigned long nr_to_reclaim = sc->nr_to_reclaim;
 	struct blk_plug plug;
 	bool scan_adjusted;
+
+	if (lru_gen_shrink_lruvec(lruvec, sc))
+		return;
 
 	get_scan_count(lruvec, memcg, sc, nr, lru_pages);
 

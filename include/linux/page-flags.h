@@ -107,6 +107,12 @@ enum pageflags {
 	PG_young,
 	PG_idle,
 #endif
+#ifdef CONFIG_LRU_GEN
+	PG_lru_gen,
+	PG_lru_gen_0,
+	PG_lru_gen_1,
+	PG_lru_gen_tier,
+#endif
 	__NR_PAGEFLAGS,
 
 	/* Filesystems */

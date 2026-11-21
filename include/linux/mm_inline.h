@@ -47,12 +47,21 @@ static __always_inline void add_page_to_lru_list(struct page *page,
 				struct lruvec *lruvec, enum lru_list lru)
 {
 	update_lru_size(lruvec, lru, page_zonenum(page), hpage_nr_pages(page));
+	if (lru_gen_enabled() && lru < LRU_UNEVICTABLE) {
+		lru_gen_add_page(page, lruvec, false);
+		return;
+	}
 	list_add(&page->lru, &lruvec->lists[lru]);
 }
 
 static __always_inline void del_page_from_lru_list(struct page *page,
 				struct lruvec *lruvec, enum lru_list lru)
 {
+	if (test_bit(PG_lru_gen, &page->flags)) {
+		lru_gen_del_page(page, lruvec, false);
+		update_lru_size(lruvec, lru, page_zonenum(page), -hpage_nr_pages(page));
+		return;
+	}
 	list_del(&page->lru);
 	update_lru_size(lruvec, lru, page_zonenum(page), -hpage_nr_pages(page));
 }

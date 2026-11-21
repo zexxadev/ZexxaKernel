@@ -229,6 +229,29 @@ struct zone_reclaim_stat {
 	unsigned long		recent_scanned[2];
 };
 
+#ifdef CONFIG_LRU_GEN
+#define MIN_NR_GENS		2
+#define MAX_NR_GENS		4
+#define MAX_NR_TIERS		2
+#define ANON_AND_FILE		2
+
+struct lru_gen_struct {
+	unsigned long max_seq;
+	unsigned long min_seq[ANON_AND_FILE];
+	unsigned long timestamps[MAX_NR_GENS];
+	struct list_head lists[MAX_NR_GENS][ANON_AND_FILE][MAX_NR_ZONES];
+	long nr_pages[MAX_NR_GENS][ANON_AND_FILE][MAX_NR_ZONES];
+};
+
+extern bool lru_gen_enabled(void);
+extern void lru_gen_add_page(struct page *page, struct lruvec *lruvec, bool reclaiming);
+extern void lru_gen_del_page(struct page *page, struct lruvec *lruvec, bool reclaiming);
+#else
+static inline bool lru_gen_enabled(void) { return false; }
+static inline void lru_gen_add_page(struct page *page, struct lruvec *lruvec, bool reclaiming) {}
+static inline void lru_gen_del_page(struct page *page, struct lruvec *lruvec, bool reclaiming) {}
+#endif
+
 struct lruvec {
 	struct list_head		lists[NR_LRU_LISTS];
 	struct zone_reclaim_stat	reclaim_stat;
@@ -236,6 +259,9 @@ struct lruvec {
 	atomic_long_t			inactive_age;
 #ifdef CONFIG_MEMCG
 	struct pglist_data *pgdat;
+#endif
+#ifdef CONFIG_LRU_GEN
+	struct lru_gen_struct lrugen;
 #endif
 };
 
