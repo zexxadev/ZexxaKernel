@@ -28,6 +28,12 @@ char *migrate_reason_names[MR_TYPES] = {
 const struct trace_print_flags pageflag_names[] = {
 	__def_pageflag_names,
 	{0, NULL}
+#ifdef CONFIG_LRU_GEN
+	{1UL << PG_lru_gen,		"lru_gen"	},
+	{1UL << PG_lru_gen_0,		"lru_gen_0"	},
+	{1UL << PG_lru_gen_1,		"lru_gen_1"	},
+	{1UL << PG_lru_gen_tier,	"lru_gen_tier"	},
+#endif
 };
 
 const struct trace_print_flags gfpflag_names[] = {
