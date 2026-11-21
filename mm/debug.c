@@ -33,6 +33,12 @@ const struct trace_print_flags pageflag_names[] = {
 	{1UL << PG_lru_gen_0,		"lru_gen_0"	},
 	{1UL << PG_lru_gen_1,		"lru_gen_1"	},
 	{1UL << PG_lru_gen_tier,	"lru_gen_tier"	},
+#endif,
+#ifdef CONFIG_LRU_GEN
+	{1UL << PG_lru_gen,		"lru_gen"	},
+	{1UL << PG_lru_gen_0,		"lru_gen_0"	},
+	{1UL << PG_lru_gen_1,		"lru_gen_1"	},
+	{1UL << PG_lru_gen_tier,	"lru_gen_tier"	},
 #endif
 };
 
