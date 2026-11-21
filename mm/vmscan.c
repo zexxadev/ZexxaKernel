@@ -2554,6 +2554,8 @@ static unsigned long evict_gen_pages(struct lruvec *lruvec, struct scan_control 
 	LIST_HEAD(list);
 	unsigned long nr_isolated = 0;
 	unsigned long nr_reclaimed = 0;
+	unsigned long nr_dirty = 0, nr_unqueued_dirty = 0;
+	unsigned long nr_congested = 0, nr_writeback = 0, nr_immediate = 0;
 	struct blk_plug plug;
 
 	if (seq + MIN_NR_GENS > lrugen->max_seq)
@@ -2588,10 +2590,7 @@ static unsigned long evict_gen_pages(struct lruvec *lruvec, struct scan_control 
 				continue;
 			}
 
-			if (!TestClearPageLRU(page)) {
-				put_page(page);
-				continue;
-			}
+			ClearPageLRU(page);
 
 			lru_gen_del_page(page, lruvec, true);
 			update_lru_size(lruvec, type ? LRU_INACTIVE_FILE : LRU_INACTIVE_ANON,
@@ -2604,7 +2603,9 @@ static unsigned long evict_gen_pages(struct lruvec *lruvec, struct scan_control 
 	if (!list_empty(&list)) {
 		blk_start_plug(&plug);
 		nr_reclaimed = shrink_page_list(&list, lruvec_pgdat(lruvec), sc,
-						TTU_UNMAP, NULL, false);
+						TTU_UNMAP, &nr_dirty, &nr_unqueued_dirty,
+						&nr_congested, &nr_writeback, &nr_immediate,
+						false);
 		blk_finish_plug(&plug);
 		putback_inactive_pages(lruvec, &list);
 	}
